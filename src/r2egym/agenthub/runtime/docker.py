@@ -576,7 +576,7 @@ class DockerRuntime(ExecutionEnvironment):
 
     def reset(self):
         self.stop_container()
-        self.start_container(self.docker_image, self.command, **self.docker_kwargs)
+        self.start_container(self.docker_image, self.command, self.container_name, **self.docker_kwargs)
 
     def close(self):
         self.stop_container()
