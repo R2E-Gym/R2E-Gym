@@ -1,0 +1,30 @@
+[Unit]
+Description=Docker Disk Space Watchdog Service
+Documentation=Docker image cleanup when disk space is low
+After=network.target
+Wants=docker.service
+
+[Service]
+Type=simple
+User=jiahaoyu
+Group=jiahaoyu
+WorkingDirectory=/home/jiahaoyu/projects/R2E-Gym
+ExecStart=/home/jiahaoyu/projects/R2E-Gym/docker_bash_utils/disk_watchdog.sh --threshold 1000 --interval 300
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits
+MemoryLimit=256M
+CPUQuota=10%
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/jiahaoyu/projects/R2E-Gym/docker_bash_utils
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target
