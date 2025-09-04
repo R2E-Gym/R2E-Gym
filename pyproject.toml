@@ -38,8 +38,9 @@ dependencies = [
     "kubernetes>=32.0.1",
     "gpustat>=1.1.1",
     "orjson>=3.10.18",
+    "r2e @ git+https://github.com/r2e-project/r2e.git",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 readme = "README.md"
 
 [dependency-groups]
