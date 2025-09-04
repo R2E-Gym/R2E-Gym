@@ -1,0 +1,13 @@
+### Note: DO NOT use quantized model or quantization_bit when merging lora adapters
+
+### model
+model_name_or_path: Qwen/Qwen3-Coder-30B-A3B-Instruct
+adapter_name_or_path: /projects/p32304/Code-LLM/saves/Qwen/Qwen3-Coder-30B-A3B-Instruct/lora/sft
+template: qwen3_nothink
+trust_remote_code: true
+
+### export
+export_dir: /projects/p32304/Code-LLM/saves/Qwen/Qwen3-Coder-30B-A3B-Instruct/merged/sft
+export_size: 5
+export_device: cpu  # choices: [cpu, auto]
+export_legacy_format: false
