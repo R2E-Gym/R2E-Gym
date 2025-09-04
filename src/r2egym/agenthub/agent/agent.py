@@ -11,7 +11,6 @@ from pydantic import BaseModel
 
 import litellm
 from openai import OpenAI
-
 from r2egym.agenthub.action import Action
 from r2egym.agenthub.utils.log import get_logger
 from r2egym.agenthub.environment.env import RepoEnv
@@ -40,7 +39,7 @@ class AgentArgs:
     instance_prompt: str
     command_files: List[Path]
     llm_name: str
-    llm_base_url: Optional[str] = "http://localhost:8000/v1"  # None
+    llm_base_url: Optional[str] = None
     demo_file: Optional[Path] = None
     use_demo: Optional[bool] = False
     other_args: Optional[Dict[str, Any]] = None  # To handle extra configurations
@@ -67,8 +66,11 @@ class Agent:
         else:
             self.logger = logger
         self.llm_name = args.llm_name
-
-        self.llm_base_url = (
+        self.other_args = args.other_args or {}
+        if args.llm_base_url is not None:
+            self.llm_base_url = args.llm_base_url
+        else:
+            self.llm_base_url = (
             # "http://localhost:8000/v1"
             os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1")
             if ("openai/" in self.llm_name) or ("hosted_vllm" in self.llm_name)
@@ -77,10 +79,15 @@ class Agent:
         self.system_prompt_template = args.system_prompt
         self.instance_prompt_template = args.instance_prompt
         self.command_files = args.command_files
-        self.other_args = args.other_args or {}
         self.logger.info(f"Initialized Agent: {name} with LLM: {args.llm_name}")
         self.max_retries = self.other_args.get("max_retries", 5)
         self.llm_timeout = self.other_args.get("timeout", 3000)
+        self.top_p = self.other_args.get("top_p", None)
+        self.top_k = self.other_args.get("top_k", None)
+        self.repetition_penalty = self.other_args.get("repetition_penalty", None)
+        self.openai_key = self.other_args.get("openai_key", None)
+        if self.openai_key is not None:
+            os.environ["OPENAI_API_KEY"] = self.openai_key
 
 
 
@@ -192,22 +199,30 @@ class Agent:
         
         # query the model with retries
         while retries < self.max_retries:
+            kwargs = {}
+            if self.top_p is not None:
+                kwargs["top_p"] = self.top_p
+            if self.top_k is not None:
+                kwargs["top_k"] = self.top_k
+            if self.repetition_penalty is not None:
+                kwargs["repetition_penalty"] = self.repetition_penalty
+            if tools:
+                    # When tools are provided, let the model choose freely
+                    pass  
+            else:
+                # When no tools are provided, don't set tool_choice at all
+                kwargs["function_call"] = None
+
+            if "o3" not in self.llm_name and "o4" not in self.llm_name:
+                kwargs["temperature"] = temperature
             try:
-                kwargs = {
-                    "tool_choice": "none",
-                    "function_call": None,
-                }
-                if tools:
-                    kwargs = {}
-                if "o3" not in self.llm_name and "o4" not in self.llm_name:
-                    kwargs["temperature"] = temperature
                 response = litellm.completion(
                     model=self.llm_name,
                     tools=tools,
                     messages=messages_,
                     timeout=self.llm_timeout,
                     api_base=self.llm_base_url,
-                    # max_tokens=3000,
+                    max_tokens=16384,
                     **kwargs,
                 )
                 self.logger.warning(f"Querying LLM complete")
@@ -348,7 +363,10 @@ class Agent:
         # Prepare problem_statement and structure from the environment
         problem_statement = env.runtime.get_task_instruction()
         self.logger.info(f"Problem Statement: {problem_statement}")
-        gt_patch = env.runtime.commit.get_patch(test_file=True, non_test_file=False)
+        try:
+            gt_patch = env.runtime.commit.get_patch(test_file=True, non_test_file=False)
+        except:
+            gt_patch = ""
 
         # get system and instance prompts
         system_prompt = self.system_prompt_template
@@ -441,7 +459,7 @@ class Agent:
             if self.use_fn_calling:
                 thought, action = self.custom_parser(response)
             else:
-                thought, action = self.parse_response(assistant_message)
+                thought, action = self.parse_response_v2(assistant_message)
 
             action_str = action.to_xml_string()
             self.logger.info(f"THOUGHT:\n{thought}\n")
@@ -585,6 +603,7 @@ class Agent:
             max_total_time=max_total_time,
             exit_reason=exit_reason,  # reason for exiting. must be one of the [agent, max_step_limit, agent_max_step_limit, abs_step_limit, token_limit, traj_time_limit, llm_query_error]
             output_patch=output_patch,
+            history=self.history,
         )
 
         self.logger.info(f"Agent completed in {time.time() - start_time} seconds.")

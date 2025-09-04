@@ -54,6 +54,7 @@ class Trajectory(BaseModel):
     # Trajectory steps data
     ##############################
     trajectory_steps: list[TrajectoryStep]
+    history: list[dict]
 
     ##############################
     # problem metadata
@@ -99,6 +100,7 @@ class Trajectory(BaseModel):
     regression_test_output: Optional[str] = None  # regression test output
     verifier_prob: Optional[float] = None  # verifier yes probability
     reproduction_test_scores: list[int] = []  # reproduction test score
+    finished_score: Optional[int] = None  # finished score
 
     @classmethod
     def load_from_model_dump_json(cls, json_string: str):

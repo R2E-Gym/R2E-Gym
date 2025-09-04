@@ -201,6 +201,7 @@ def runagent(
     max_iterations: int = 1,
     scaffold: str = "r2egym",
     max_tokens: int = 65536,
+    args_path: Optional[str] = None,
 ) -> Optional[str]:
     """
     Runs the editagent agent on a specified Docker image.
@@ -211,13 +212,18 @@ def runagent(
         jsonl_file: Path to the JSONL file to save results. If not provided, generated using traj_dir and exp_name.
         exp_name: Experiment name. Used if jsonl_file is not provided. If not provided, a unique name is generated.
     """
-    logger = setup_logging(
+    if 'docker_image' in ds:
         name=ds["docker_image"].replace("/", "_"),
-        log_file=f"run_logs/{exp_name}/{ds['docker_image'].replace('/', '_')}.log",
+    elif 'image_name' in ds:
+        name=ds["image_name"].replace("/", "_")
+    else:
+        raise ValueError(f"No docker image found in ds: {ds}")
+    logger = setup_logging(
+        log_file=f"run_logs/{exp_name}/{name}.log",
         console=True,
         level=INFO,
     )
-    logger.info(f"Starting editagent on Docker image: {ds['docker_image']}")
+    logger.info(f"Starting editagent on Docker image: {name}")
     logger.info(f"Using LLM: {llm_name}")
     logger.info(f"Max Steps: {max_steps}")
 
@@ -241,6 +247,9 @@ def runagent(
         agent_args = AgentArgs.from_yaml(
             Path(f"./src/r2egym/agenthub/config/{scaffold}/edit_non_fn_calling.yaml")
         )
+    if args_path is not None:
+        agent_args = AgentArgs.from_yaml(Path(args_path))
+        print(f"Using agent args from {args_path} to override the default agent args")
     agent_args.llm_name = llm_name
 
     # Initialize the agent
@@ -262,7 +271,7 @@ def runagent(
         )
     except Exception as e:
         logger.error(
-            f"Error during agent run for Docker image {ds['docker_image']}: {e}"
+            f"Error during agent run for Docker image {name}: {e}"
         )
         return None
 
@@ -281,9 +290,9 @@ def runagent(
     trajectory.reward_calc_time = reward_calc_time # time taken to calculate reward
     logger.warning(f"time taken to calculate reward in seconds: {reward_calc_time:.2f}")
 
-    logger.info(f"editagent completed for Docker image: {ds['docker_image']}")
+    logger.info(f"editagent completed for Docker image: {name}")
     # close env and docker runtime
-    logger.info(f"Closing environment for Docker image: {ds['docker_image']}")
+    logger.info(f"Closing environment for Docker image: {name}")
     return trajectory.model_dump_json()
 
 
