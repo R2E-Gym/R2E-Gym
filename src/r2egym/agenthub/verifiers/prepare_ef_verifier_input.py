@@ -13,40 +13,41 @@ logger = logging.getLogger(__name__)
 def deepswe_condense_thoughts(
     input_str: str,
     max_tokens: int = 31000,
-    tokenizer_name="Qwen/Qwen2.5-Coder-32B-Instruct",
+    tokenizer_name="Qwen/Qwen3-Coder-30B-A3B-Instruct",
 ) -> str:
     """
     If the token count of input_str exceeds max_tokens, then starting with the second
-    [ASSISTANT]...[/ASSISTANT] block (the oldest after the first), replace its inner content with
+    [USER]...[/USER] block (the oldest after the first), replace its inner content with
     a placeholder until the total token count is under the limit.
 
-    The first [ASSISTANT] block is left intact.
+    The first [USER] block is left intact.
     """
-    placeholder = "<Thought condensed for saving context>"
+    placeholder = "<Execution result condensed for saving context>"
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
     # Check initial token count
     if len(tokenizer.encode(input_str)) <= max_tokens:
         return input_str
 
-    # Regex to match thoughts between [ASSISTANT] and <function
-    pattern = re.compile(r"(\[ASSISTANT\])(.*?)(<function)", re.DOTALL)
+    # Regex to match content between [USER] and [/USER]
+    pattern = re.compile(r"(\[USER\])(.*?)(\[/USER\])", re.DOTALL)
 
     new_str = input_str
     # Continue condensing until token count is below the threshold or nothing changes.
     while len(tokenizer.encode(new_str)) > max_tokens:
-        # Re-find all [ASSISTANT] blocks in the updated string
+        # Re-find all [USER] blocks in the updated string
         matches = list(pattern.finditer(new_str))
         if len(matches) <= 1:
-            # Nothing more to condense (either no [ASSISTANT] blocks or only one exists)
+            # Nothing more to condense (either no [USER] blocks or only one exists)
             break
 
         # Sort matches by content length (descending) - biggest first
-        # Filter out already condensed blocks
-        uncondensed_matches = [m for m in matches if m.group(2).strip() != placeholder]
+        # Filter out already condensed blocks and skip the first user message
+        uncondensed_matches = [m for i, m in enumerate(matches)
+                             if i > 0 and m.group(2).strip() != placeholder]
 
         if not uncondensed_matches:
-            # All blocks are already condensed
+            # All blocks are already condensed or only first block remains
             break
 
         # Sort by content length (group(2) is the content)
@@ -61,14 +62,14 @@ def deepswe_condense_thoughts(
 
         # print warning for removing
         print(
-            f"Warning: Removing {len(tokenizer.encode(m.group(2)))} tokens from [ASSISTANT] block"
+            f"Warning: Removing {len(tokenizer.encode(m.group(2)))} tokens from [USER] block"
         )
 
     return new_str
 
 
 def compute_total_tokens(
-    training_data_entry, tokenizer_name="Qwen/Qwen2.5-Coder-32B-Instruct"
+    training_data_entry, tokenizer_name="Qwen/Qwen3-Coder-30B-A3B-Instruct"
 ):
     """
     Compute the total number of tokens in the training data entry
@@ -82,7 +83,7 @@ def compute_total_tokens(
 
     combined_text = " ".join([x["content"] for x in training_data_entry])
     # Encode the text to get the token count
-    # add_special_tokens=False so that e.g. GPT-2's <|endoftext|> is not counted
+    # add_special_tokens=False so that e.g. GPT-2's <|endoftext| > is not counted
     tokens = tokenizer.encode(combined_text, add_special_tokens=False)
     return len(tokens)
 
