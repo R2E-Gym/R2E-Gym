@@ -45,7 +45,10 @@ class RepoEnv(gym.Env):
             #logging.disable(logging.CRITICAL)  # Disable all logging
 
         self.runtime = DockerRuntime(
-            ds=args.ds, command=["/bin/bash", "-l"], logger=self.logger, backend=backend
+            ds=args.ds,
+            command=["-lc", "while true; do sleep 3600; done"],
+            logger=self.logger,
+            backend=backend,
         )
 
         self.args = args
@@ -72,7 +75,10 @@ class RepoEnv(gym.Env):
         self.done = False
         # also just recreate env again with the same args
         self.runtime = DockerRuntime(
-            ds=self.args.ds, command=["/bin/bash", "-l"], logger=self.logger, backend=self.backend
+            ds=self.args.ds,
+            command=["-lc", "while true; do sleep 3600; done"],
+            logger=self.logger,
+            backend=self.backend,
         )
         return self.observation  # self.get_observation()
 
@@ -96,12 +102,28 @@ class RepoEnv(gym.Env):
             # Get the base name of the command file
             cmd_name = os.path.basename(cmd_file)
 
-            if ext == ".py" or self._is_shebang_script(cmd_file):
-                # Python script or shebang script: copy, strip .py extension if applicable
-                if ext == ".py":
-                    container_cmd_name = cmd_name[:-3]  # Remove .py extension
-                else:
-                    container_cmd_name = cmd_name
+            if ext == ".py":
+                container_cmd_name = cmd_name[:-3]
+                container_py_path = f"/usr/local/bin/{container_cmd_name}.py"
+                container_wrapper_path = f"/usr/local/bin/{container_cmd_name}"
+                self.runtime.copy_to_container(cmd_file, container_py_path)
+                self.runtime.run(f"chmod +x {container_py_path}")
+                wrapper = (
+                    "#!/bin/sh\n"
+                    f"exec python3 {container_py_path} \"$@\"\n"
+                )
+                self.runtime.run(
+                    "/bin/sh",
+                    args=(
+                        "-lc "
+                        + self._sh_quote(
+                            f"cat > {container_wrapper_path} <<'EOF'\n{wrapper}EOF\nchmod +x {container_wrapper_path}"
+                        )
+                    ),
+                    workdir="/",
+                )
+            elif self._is_shebang_script(cmd_file):
+                container_cmd_name = cmd_name
                 container_path = f"/usr/local/bin/{container_cmd_name}"
                 self.runtime.copy_to_container(cmd_file, container_path)
                 self.runtime.run(f"chmod +x {container_path}")
@@ -127,6 +149,9 @@ class RepoEnv(gym.Env):
         # Store the parsed commands for reference
         self.commands = cmds
         self.logger.info(f"Added {len(cmds)} commands to the environment.")
+
+    def _sh_quote(self, s: str) -> str:
+        return "'" + s.replace("'", "'\"'\"'") + "'"
 
     def _is_shebang_script(self, cmd_file: str) -> bool:
         """

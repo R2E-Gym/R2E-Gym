@@ -1,5 +1,6 @@
 # editagent_script.py
 
+import os
 import openai
 import re
 import yaml
@@ -11,6 +12,9 @@ import json
 import concurrent.futures
 import threading
 import docker
+import traceback
+import stat
+import subprocess
 
 from r2egym.agenthub.runtime.docker import DockerRuntime
 from r2egym.agenthub.environment.env import EnvArgs, RepoEnv
@@ -37,6 +41,137 @@ logger = get_logger(__name__)  # Initialize the logger
 # Initialize File Lock for Thread-Safe Writing
 ##############################################################################
 file_lock = threading.Lock()
+
+def _ensure_docker_host():
+    if os.environ.get("DOCKER_HOST"):
+        return
+    for p in [
+        os.path.expanduser("~/.colima/default/docker.sock"),
+        os.path.expanduser("~/.docker/run/docker.sock"),
+        "/var/run/docker.sock",
+    ]:
+        try:
+            real = os.path.realpath(p)
+            if os.path.exists(real) and stat.S_ISSOCK(os.stat(real).st_mode):
+                os.environ["DOCKER_HOST"] = f"unix://{real}"
+                return
+        except Exception:
+            pass
+    try:
+        with open(os.path.expanduser("~/.docker/config.json")) as f:
+            cfg = json.load(f)
+        if cfg.get("currentContext") != "colima":
+            raise RuntimeError("skip_config_context")
+    except Exception:
+        cfg = None
+    sock = os.path.expanduser("~/.colima/default/docker.sock")
+    if os.path.exists(sock):
+        os.environ["DOCKER_HOST"] = f"unix://{sock}"
+
+    if os.environ.get("DOCKER_HOST"):
+        return
+    try:
+        ctx = (
+            subprocess.run(
+                ["docker", "context", "show"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            .stdout.strip()
+        )
+        if ctx:
+            host = (
+                subprocess.run(
+                    ["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}", ctx],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                .stdout.strip()
+            )
+            if host:
+                os.environ["DOCKER_HOST"] = host
+    except Exception:
+        pass
+
+
+def _require_docker_access():
+    try:
+        docker.from_env(timeout=10).version()
+        return
+    except Exception as e:
+        raise RuntimeError(
+            "docker_unavailable: "
+            + repr(e)
+            + " DOCKER_HOST="
+            + repr(os.environ.get("DOCKER_HOST"))
+            + " (start Docker Desktop/colima and ensure a working docker.sock, or set DOCKER_HOST to the docker daemon endpoint)"
+        )
+
+def _normalize_ds_for_dockerruntime(ds: Dict[str, Any]) -> Dict[str, Any]:
+    ds = dict(ds)
+
+    if "docker_image" not in ds and "image_name" not in ds and ds.get("dockerhub_tag"):
+        dockerhub_tag = str(ds["dockerhub_tag"])
+        if "-" in dockerhub_tag:
+            repo_prefix, tag_rest = dockerhub_tag.split("-", 1)
+        else:
+            repo_prefix, tag_rest = "unknown", dockerhub_tag
+
+        repo_template = os.environ.get(
+            "SWEBENCH_PRO_IMAGE_REPO_TEMPLATE", "jefzda/sweap-images"
+        )
+        if "{repo_prefix}" in repo_template:
+            image_repo = repo_template.format(repo_prefix=repo_prefix)
+            tag = tag_rest
+        else:
+            image_repo = repo_template
+            tag = dockerhub_tag
+        ds["docker_image"] = f"{image_repo}:{tag}"
+
+    if "repo_name" not in ds and ds.get("repo"):
+        ds["repo_name"] = str(ds["repo"]).split("/")[-1]
+
+    if "problem_statement" not in ds and ds.get("problem"):
+        ds["problem_statement"] = ds["problem"]
+
+    if "parsed_commit_content" not in ds and ("patch" in ds or "test_patch" in ds):
+        from r2egym.commit_models.parse_diff import CommitParser
+
+        patch = ds.get("patch") or ""
+        test_patch = ds.get("test_patch") or ""
+        diff_text = "\n".join([patch.strip(), test_patch.strip()]).strip() + "\n"
+        if diff_text.strip():
+            base_commit = str(ds.get("base_commit") or "")
+            parser = CommitParser()
+            try:
+                parsed = parser.parse_commit(
+                    old_commit_hash=base_commit,
+                    new_commit_hash=base_commit,
+                    diff_text=diff_text,
+                    commit_message="",
+                    commit_date=datetime.now(),
+                    repo_location=None,
+                )
+                ds["parsed_commit_content"] = parsed.model_dump_json()
+            except Exception:
+                if ds.get("parsed_commit") is not None:
+                    ds["parsed_commit_content"] = ds["parsed_commit"]
+                else:
+                    from r2egym.commit_models.diff_classes import ParsedCommit
+
+                    ds["parsed_commit_content"] = ParsedCommit(
+                        file_diffs=[],
+                        old_commit_hash=base_commit,
+                        new_commit_hash=base_commit,
+                        commit_message="",
+                        commit_date=datetime.now(),
+                    ).model_dump_json()
+
+    return ds
 
 
 ##############################################################################
@@ -193,7 +328,7 @@ def runagent(
     max_steps=40,
     num_restarts=1,
     max_steps_absolute=50,
-    llm_name="gpt-4o",
+    llm_name: Optional[str] = "gpt-4o",
     temperature=0,
     use_fn_calling: bool = True,
     backend: str = "kubernetes", # "kubernetes" or "docker"
@@ -201,6 +336,7 @@ def runagent(
     max_iterations: int = 1,
     scaffold: str = "r2egym",
     max_tokens: int = 65536,
+    local_model_path: Optional[str] = None,
 ) -> Optional[str]:
     """
     Runs the editagent agent on a specified Docker image.
@@ -211,28 +347,80 @@ def runagent(
         jsonl_file: Path to the JSONL file to save results. If not provided, generated using traj_dir and exp_name.
         exp_name: Experiment name. Used if jsonl_file is not provided. If not provided, a unique name is generated.
     """
+    if backend == "docker":
+        _ensure_docker_host()
+        _require_docker_access()
+    if not llm_name:
+        llm_name = "local"
+    llm_base_url_env = os.environ.get("LLM_BASE_URL") or ""
+    llm_provider_env = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
+    if local_model_path is None and llm_base_url_env and "/" not in llm_name:
+        provider = "openai"
+        if llm_provider_env in {"anthropic", "openai"}:
+            provider = llm_provider_env
+        elif "/v1/messages" in llm_base_url_env or llm_base_url_env.rstrip("/").endswith(
+            "/messages"
+        ):
+            provider = "anthropic"
+        llm_name = f"{provider}/{llm_name}"
+
+    ds = _normalize_ds_for_dockerruntime(ds)
+    docker_image_for_log = ds.get("docker_image") or ds.get("image_name") or "unknown_image"
+
     logger = setup_logging(
-        name=ds["docker_image"].replace("/", "_"),
-        log_file=f"run_logs/{exp_name}/{ds['docker_image'].replace('/', '_')}.log",
+        name=docker_image_for_log.replace("/", "_"),
+        log_file=f"run_logs/{exp_name}/{docker_image_for_log.replace('/', '_')}.log",
         console=True,
         level=INFO,
     )
-    logger.info(f"Starting editagent on Docker image: {ds['docker_image']}")
+    logger.info(f"Starting editagent on Docker image: {docker_image_for_log}")
     logger.info(f"Using LLM: {llm_name}")
+    logger.info(f"Local model path: {local_model_path}")
     logger.info(f"Max Steps: {max_steps}")
 
     assert scaffold in ["r2egym", "sweagent", "openhands"], f"Scaffold is {scaffold}, must be one of [r2egym, sweagent, openhands]"
+    effective_use_fn_calling = bool(use_fn_calling)
+    if local_model_path or (llm_name and "qwen" in llm_name.lower()):
+        effective_use_fn_calling = False
     # Generate a unique experiment name if not provided
     if exp_name is None:
         exp_name = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+
     # Initialize environment arguments
     env_args = EnvArgs(ds=ds)
 
-    # Initialize the RepoEnv
-    env = RepoEnv(env_args, logger=logger, backend=backend)
+    try:
+        env = RepoEnv(env_args, logger=logger, backend=backend)
+    except Exception as e:
+        logger.error(f"Error initializing environment for Docker image {docker_image_for_log}: {repr(e)}")
+        try:
+            tb = re.sub(r"\x1b\[[0-9;]*m|\r", "", traceback.format_exc())
+        except Exception:
+            tb = ""
+        trajectory = Trajectory(
+            trajectory_steps=[],
+            problem_statement=str(ds.get("problem_statement") or ""),
+            docker_image=docker_image_for_log,
+            exp_name=exp_name,
+            env_args=asdict(env_args),
+            agent_args={},
+            ds=ds,
+            max_steps=max_steps,
+            max_steps_absolute=max_steps_absolute,
+            max_token_limit=max_tokens,
+            max_llm_time=7200,
+            max_exec_time=90,
+            max_total_time=50000,
+            exit_reason="env_exception",
+            output_patch="",
+            reward=0.0,
+            reward_calc_time=0.0,
+            test_output=f"[ENV_EXCEPTION]\\n{repr(e)}\\n{tb}".strip() + "\n",
+        )
+        return trajectory.model_dump_json()
     # set agent args
-    if use_fn_calling:
+    if effective_use_fn_calling:
         assert scaffold != "sweagent", "SWEagent scaffold does not support fn calling"
         agent_args = AgentArgs.from_yaml(
             Path(f"./src/r2egym/agenthub/config/{scaffold}/edit_fn_calling.yaml")
@@ -242,11 +430,13 @@ def runagent(
             Path(f"./src/r2egym/agenthub/config/{scaffold}/edit_non_fn_calling.yaml")
         )
     agent_args.llm_name = llm_name
+    agent_args.local_model_path = local_model_path
 
     # Initialize the agent
     agent = Agent(name="EditAgent", args=agent_args, logger=logger)
 
     # run agent editagent
+    trajectory = None
     try:
         trajectory = run_agent_with_restarts(
             agent,
@@ -255,20 +445,54 @@ def runagent(
             num_restarts=num_restarts,
             temperature=temperature,
             max_steps_absolute=max_steps_absolute,
-            use_fn_calling=use_fn_calling,
+            use_fn_calling=effective_use_fn_calling,
             max_iterations=max_iterations,
             scaffold=scaffold,
             max_tokens=max_tokens,
         )
     except Exception as e:
-        logger.error(
-            f"Error during agent run for Docker image {ds['docker_image']}: {e}"
+        logger.error(f"Error during agent run for Docker image {docker_image_for_log}: {repr(e)}")
+        try:
+            tb = re.sub(r"\x1b\[[0-9;]*m|\r", "", traceback.format_exc())
+        except Exception:
+            tb = ""
+        try:
+            env.close()
+        except Exception:
+            pass
+        trajectory = Trajectory(
+            trajectory_steps=[],
+            problem_statement=str(ds.get("problem_statement") or ""),
+            docker_image=docker_image_for_log,
+            exp_name=exp_name,
+            env_args=asdict(env_args),
+            agent_args=asdict(agent_args),
+            ds=ds,
+            max_steps=max_steps,
+            max_steps_absolute=max_steps_absolute,
+            max_token_limit=max_tokens,
+            max_llm_time=7200,
+            max_exec_time=90,
+            max_total_time=50000,
+            exit_reason="agent_exception",
+            output_patch="",
+            reward=0.0,
+            reward_calc_time=0.0,
+            test_output=f"[EXCEPTION]\\n{repr(e)}\\n{tb}".strip() + "\n",
         )
-        return None
+        return trajectory.model_dump_json()
 
     # also get the gt outputs
     reward_calc_time = time.time()
-    reward, test_output = env.runtime._calculate_reward(get_test_output=True, timeout=max_reward_calc_time)
+    try:
+        reward, test_output = env.runtime._calculate_reward(get_test_output=True, timeout=max_reward_calc_time)
+    except Exception as e:
+        reward = 0.0
+        try:
+            tb = re.sub(r"\x1b\[[0-9;]*m|\r", "", traceback.format_exc())
+        except Exception:
+            tb = ""
+        test_output = f"[REWARD_EXCEPTION]\\n{repr(e)}\\n{tb}".strip() + "\n"
     reward_calc_time = time.time() - reward_calc_time
     # Close the environment and runtime
     env.close()
@@ -298,7 +522,7 @@ def runagent_multiple(
     num_restarts=1,
     max_steps_absolute=50,
     max_workers: Optional[int] = None,
-    llm_name="gpt-4o",
+    llm_name: Optional[str] = "gpt-4o",
     use_existing: bool = True,
     skip_existing: bool = False,
     temperature: float = 0,
@@ -309,6 +533,7 @@ def runagent_multiple(
     scaffold: str = "r2egym",
     prepull_images: bool = False,
     max_tokens: int = 65536,
+    local_model_path: Optional[str] = None,
 ):
     """
     Runs the editagent agent on the first k Docker images.
@@ -322,6 +547,8 @@ def runagent_multiple(
         max_workers: Maximum number of threads to use.
         prepull_images: Whether to prepull Docker images in parallel before starting execution.
     """
+    if not llm_name:
+        llm_name = "local"
     # Load the dataset
     ds = load_dataset(dataset, split=split)
     logger.info(f"{len(ds)}, {k}, {start_idx}")
@@ -415,6 +642,7 @@ def runagent_multiple(
                 max_iterations=max_iterations,
                 scaffold=scaffold,
                 max_tokens=max_tokens,
+                local_model_path=local_model_path,
             ): ds_entry[
                 "docker_image"
             ]  # <-- store the docker_image from ds_entry here
@@ -437,6 +665,154 @@ def runagent_multiple(
 
     logger.info(f"editagent completed on {len(ds_selected)} Docker images.")
 
+def runagent_multiple_parquet(
+    parquet_path: str,
+    k: int = 1,
+    traj_dir: str = "./traj",
+    exp_name: Optional[str] = None,
+    start_idx: int = 0,
+    indices: Optional[str] = None,
+    shuffle: bool = True,
+    seed: int = 42,
+    max_steps: int = 40,
+    num_restarts: int = 1,
+    max_steps_absolute: int = 50,
+    llm_name: Optional[str] = "gpt-4o",
+    use_existing: bool = True,
+    skip_existing: bool = False,
+    temperature: float = 0,
+    use_fn_calling: bool = True,
+    backend: str = "docker",
+    max_reward_calc_time: int = 300,
+    max_iterations: int = 1,
+    scaffold: str = "r2egym",
+    max_tokens: int = 65536,
+    local_model_path: Optional[str] = None,
+    max_workers: Optional[int] = None,
+    parallel: bool = False,
+    dry_run: bool = False,
+):
+    if backend == "docker":
+        _ensure_docker_host()
+        _require_docker_access()
+    if not llm_name:
+        llm_name = "local"
+    import pandas as pd
+
+    df = pd.read_parquet(parquet_path)
+    if shuffle:
+        df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    if indices:
+        selected_idx = [int(x) for x in indices.split(",") if x.strip()]
+    else:
+        selected_idx = list(range(start_idx, start_idx + k))
+
+    ds_selected: List[Dict[str, Any]] = []
+    for i in selected_idx:
+        ds_selected.append(_normalize_ds_for_dockerruntime(df.iloc[i].to_dict()))
+
+    logger.info(
+        f"Parquet: {parquet_path}, Num_total: {len(df)}, Selected: {len(ds_selected)}, Start Index: {start_idx}, k: {k}"
+    )
+
+    if exp_name is None:
+        exp_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    traj_dir_path = Path(traj_dir)
+    traj_dir_path.mkdir(parents=True, exist_ok=True)
+    jsonl_file = traj_dir_path / f"{exp_name}.jsonl"
+
+    existing_instance_ids = set()
+    if use_existing and jsonl_file.exists():
+        with open(jsonl_file) as f:
+            for line in f:
+                try:
+                    traj = Trajectory.load_from_model_dump_json(line)
+                    if traj.ds and traj.ds.get("instance_id"):
+                        existing_instance_ids.add(traj.ds["instance_id"])
+                except Exception:
+                    continue
+        ds_selected = [x for x in ds_selected if x.get("instance_id") not in existing_instance_ids]
+
+    if skip_existing:
+        old_jsonl_files_glob = f"{exp_name[:-1]}*"
+        for old_jsonl_file in traj_dir_path.glob(old_jsonl_files_glob):
+            with open(old_jsonl_file) as f:
+                for line in f:
+                    try:
+                        loadline = json.loads(line)
+                        if loadline.get("reward") == 1 and loadline.get("ds", {}).get("instance_id"):
+                            existing_instance_ids.add(loadline["ds"]["instance_id"])
+                    except Exception:
+                        continue
+        ds_selected = [x for x in ds_selected if x.get("instance_id") not in existing_instance_ids]
+
+    logger.info(f"Starting editagent on {len(ds_selected)} instances after filtering.")
+
+    if dry_run:
+        for x in ds_selected:
+            logger.info(
+                json.dumps(
+                    {
+                        "instance_id": x.get("instance_id"),
+                        "repo": x.get("repo"),
+                        "docker_image": x.get("docker_image"),
+                        "dockerhub_tag": x.get("dockerhub_tag"),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return
+
+    def _run_one(ds_entry: Dict[str, Any]) -> Optional[str]:
+        return runagent(
+            ds=ds_entry,
+            exp_name=exp_name,
+            max_steps=max_steps,
+            num_restarts=num_restarts,
+            max_steps_absolute=max_steps_absolute,
+            llm_name=llm_name,
+            temperature=temperature,
+            use_fn_calling=use_fn_calling,
+            backend=backend,
+            max_reward_calc_time=max_reward_calc_time,
+            max_iterations=max_iterations,
+            scaffold=scaffold,
+            max_tokens=max_tokens,
+            local_model_path=local_model_path,
+        )
+
+    if parallel and (max_workers or 0) > 1:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_instance = {
+                executor.submit(_run_one, ds_entry): ds_entry.get("instance_id")
+                for ds_entry in ds_selected
+            }
+            with open(jsonl_file, "a") as f:
+                for future in concurrent.futures.as_completed(future_to_instance):
+                    instance_id = future_to_instance[future]
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            with file_lock:
+                                f.write(result + "\n")
+                    except Exception as e:
+                        logger.error(f"Exception for instance {instance_id}: {e}")
+    else:
+        with open(jsonl_file, "a") as f:
+            for ds_entry in ds_selected:
+                instance_id = ds_entry.get("instance_id")
+                try:
+                    result = _run_one(ds_entry)
+                    if result is not None:
+                        with file_lock:
+                            f.write(result + "\n")
+                except Exception as e:
+                    logger.error(f"Exception for instance {instance_id}: {e}")
+
+    logger.info(f"editagent completed on {len(ds_selected)} instances.")
+
 
 if __name__ == "__main__":
     # Expose functions via Fire
@@ -444,5 +820,6 @@ if __name__ == "__main__":
         {
             "runagent": runagent,
             "runagent_multiple": runagent_multiple,
+            "runagent_multiple_parquet": runagent_multiple_parquet,
         }
     )

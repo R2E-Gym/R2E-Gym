@@ -105,6 +105,8 @@ class DockerRuntime(ExecutionEnvironment):
         else:
             raise ValueError(f"No docker image found in ds: {self.ds}")
         self.docker_image = ds_image if not docker_image else docker_image
+        if repo_path == "/testbed" and "jefzda/sweap-images" in self.docker_image:
+            repo_path = "/app"
         self.swebench_verified = "swebench" in self.docker_image
         self.swesmith = "swesmith" in self.docker_image
         if self.swesmith:
@@ -113,16 +115,22 @@ class DockerRuntime(ExecutionEnvironment):
             self.docker_image = f'jyangballin/{image_name}:latest'
         
         if self.swebench_verified:
-            # also create a test spec for swebench verified dockers (useful for grading)
-            self.test_spec = make_test_spec(self.ds)
+            try:
+                self.test_spec = make_test_spec(self.ds)
+            except Exception:
+                self.swebench_verified = False
+                self.test_spec = None
 
         # set runtime params
         self.repo_path = repo_path
         self.alt_path = alt_path
         self.command = command
-        self.repo_name = (
-            self.ds["repo"] if self.swebench_verified or self.swesmith else self.ds["repo_name"]
-        )
+        if self.swebench_verified or self.swesmith:
+            self.repo_name = self.ds.get("repo") or self.ds.get("repo_name")
+        else:
+            self.repo_name = self.ds.get("repo_name") or self.ds.get("repo")
+        if not self.repo_name:
+            self.repo_name = match_dockerimage_to_repo(self.docker_image)[0]
         if not self.swesmith:
             self.commit_json = (
                 self.ds["parsed_commit"]
@@ -187,10 +195,9 @@ class DockerRuntime(ExecutionEnvironment):
         process_id = str(os.getpid())
         current_time = str(datetime.datetime.now())
         unique_string = current_time + process_id
-        hash_object = hashlib.sha256(unique_string.encode())
-        image_name_sanitized = image_name.replace("/", "-")
-        image_name_sanitized = image_name_sanitized.replace(":", "-")
-        return f"{image_name_sanitized}-{hash_object.hexdigest()[:10]}"
+        run_hash = hashlib.sha256(unique_string.encode()).hexdigest()[:10]
+        img_hash = hashlib.sha256(str(image_name).encode()).hexdigest()[:20]
+        return f"r2egym-{img_hash}-{run_hash}"
 
     def _start_kubernetes_pod(
         self, docker_image: str, command: str, pod_name: str, **docker_kwargs
@@ -353,6 +360,10 @@ class DockerRuntime(ExecutionEnvironment):
         # Start or reuse a container
         try:
             if self.backend == "docker":
+                if "jefzda/sweap-images" in docker_image:
+                    docker_kwargs.setdefault("entrypoint", "/bin/sh")
+                    if isinstance(command, list) and command and command[0] == "/bin/sh":
+                        command = command[1:]
                 containers = self.client.containers.list(
                     all=True, filters={"name": ctr_name}
                 )
@@ -366,8 +377,8 @@ class DockerRuntime(ExecutionEnvironment):
                         command,
                         name=ctr_name,
                         detach=True,
-                        tty=True,
-                        stdin_open=True,
+                        tty=False,
+                        stdin_open=False,
                         # environment={"PATH": "/commands"},
                         **docker_kwargs,
                     )
@@ -376,9 +387,50 @@ class DockerRuntime(ExecutionEnvironment):
                     docker_image, command, ctr_name, **docker_kwargs
                 )
         except Exception as e:
-            print("Container start error:", repr(e))
-            self.stop_container()
+            self.logger.error(f"Container start error: {repr(e)}")
+            try:
+                self.stop_container()
+            except Exception:
+                pass
+            raise RuntimeError(f"container_start_failed: {repr(e)}")
+        if self.backend == "docker" and self.container is not None:
+            self._wait_container_running()
+
+    def _wait_container_running(self, timeout_s: int = 30) -> None:
+        if self.backend != "docker" or self.container is None:
             return
+        start = time.time()
+        while True:
+            try:
+                self.container.reload()
+                if getattr(self.container, "status", None) == "running":
+                    return
+                if getattr(self.container, "status", None) in ("created", "restarting"):
+                    pass
+                else:
+                    try:
+                        self.container.start()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if time.time() - start > timeout_s:
+                return
+            sleep(0.5)
+
+    def _ensure_container_running(self) -> None:
+        if self.backend != "docker" or self.container is None:
+            return
+        try:
+            self.container.reload()
+            if getattr(self.container, "status", None) != "running":
+                try:
+                    self.container.start()
+                except Exception:
+                    pass
+                self._wait_container_running(timeout_s=30)
+        except Exception:
+            self._wait_container_running(timeout_s=30)
 
     def _stop_kubernetes_pod(self):
         try:
@@ -536,6 +588,21 @@ class DockerRuntime(ExecutionEnvironment):
             )
 
     def setup_env(self):
+        if "jefzda/sweap-images" in self.docker_image:
+            self.run(f"rm -rf /testbed && ln -s {self.repo_path} /testbed")
+        elif self.repo_path != "/testbed":
+            self.run(f"test -e /testbed || ln -s {self.repo_path} /testbed")
+        if "jefzda/sweap-images" in self.docker_image:
+            try:
+                self.run("mkdir -p /root/.local/bin")
+                self.run("mkdir -p /root/.venv/bin")
+                self.run("ln -sf /usr/local/bin/python /root/.venv/bin/python")
+                self.run("ln -sf /usr/local/bin/python3 /root/.venv/bin/python3")
+                self.run("ln -sf /usr/local/bin/python /root/.local/bin/python")
+                self.run("ln -sf /usr/local/bin/python3 /root/.local/bin/python3")
+            except Exception:
+                pass
+            return
         if self.swebench_verified:
             return self.setup_env_swebench()
         elif self.swesmith:
@@ -708,8 +775,33 @@ class DockerRuntime(ExecutionEnvironment):
         if self.backend == "kubernetes":
             return self._run_kubernetes(exec_code, timeout, args, workdir=exec_workdir)
 
-        command = f"timeout {timeout} {exec_code} {args}"
+        if not hasattr(self, "_has_timeout_cmd"):
+            self._has_timeout_cmd = None
+
+        if self._has_timeout_cmd is None:
+            try:
+                self._ensure_container_running()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        self.container.exec_run,
+                        cmd=["/bin/sh", "-lc", "command -v timeout >/dev/null 2>&1; echo $?"],
+                        workdir="/",
+                        stdout=True,
+                        stderr=True,
+                        environment={"PATH": DOCKER_PATH},
+                    )
+                    exec_result = future.result(timeout=15)
+                out = exec_result.output.decode("utf-8", errors="replace").strip()
+                self._has_timeout_cmd = out.endswith("0")
+            except Exception:
+                self._has_timeout_cmd = False
+
+        if self._has_timeout_cmd:
+            command = f"timeout {timeout} {exec_code} {args}"
+        else:
+            command = f"{exec_code} {args}"
         try:
+            self._ensure_container_running()
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 # Notice we do NOT set tty=True here
                 future = executor.submit(
@@ -727,7 +819,7 @@ class DockerRuntime(ExecutionEnvironment):
             output = exec_result.output.decode("utf-8", errors="replace")
             error_code = exec_result.exit_code
 
-            if error_code == 124:
+            if self._has_timeout_cmd and error_code == 124:
                 self.logger.error(f"Internal Timeout: {timeout}s")
                 return f"The command took too long to execute (>{timeout}s)", "-1"
 
@@ -735,6 +827,32 @@ class DockerRuntime(ExecutionEnvironment):
                 self.logger.error(
                     f"Error: Exit code {error_code} \nError Message: {output}"
                 )
+                if (
+                    "OCI runtime exec failed" in output
+                    and "broken pipe" in output
+                ) or (
+                    "error writing config to pipe" in output
+                ):
+                    try:
+                        sleep(1.0)
+                        self._ensure_container_running()
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                            future = executor.submit(
+                                self.container.exec_run,
+                                cmd=["/bin/sh", "-c", command],
+                                workdir=exec_workdir,
+                                stdout=True,
+                                stderr=True,
+                                environment={"PATH": DOCKER_PATH},
+                            )
+                            exec_result = future.result(timeout=timeout + 5)
+                        output = exec_result.output.decode("utf-8", errors="replace")
+                        error_code = exec_result.exit_code
+                        if error_code == 0:
+                            output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
+                            return output, str(error_code)
+                    except Exception:
+                        pass
                 return output, f"Error: Exit code {error_code}"
 
             # Remove ANSI escape codes and \r characters
@@ -843,7 +961,6 @@ class DockerRuntime(ExecutionEnvironment):
             # Kubernetes pod copy
             return self._copy_to_container_kubernetes(src_path, dest_path)
 
-    @DeprecationWarning  # TODO: remove dependency on this method with new dockers
     def read_file(self, rel_file_path: str) -> str:
         output, _ = self.run(f"cat /{self.alt_path}/{rel_file_path}")
         return output
@@ -1065,7 +1182,131 @@ class DockerRuntime(ExecutionEnvironment):
             return reward, output
         return reward
 
+    def _calculate_reward_swebenchpro(
+        self, get_test_output: bool = False, timeout: int = 300
+    ):
+        ds = self.ds or {}
+        repo_language = str(ds.get("repo_language") or "").lower()
+        selected = ds.get("selected_test_files_to_run") or []
+        if isinstance(selected, str):
+            try:
+                selected = json.loads(selected)
+            except Exception:
+                selected = [selected]
+        if not isinstance(selected, list):
+            selected = []
+        selected = [str(x) for x in selected if x]
+
+        def sq(s: str) -> str:
+            return "'" + s.replace("'", "'\"'\"'") + "'"
+
+        def preflight_missing(tool: str) -> tuple[None, str]:
+            msg = f"[PREFLIGHT]\nreward_unavailable: missing_{tool}\n"
+            return (None, msg) if get_test_output else None
+
+        def has_cmd(cmd: str) -> bool:
+            out, code = self.run(
+                "/bin/sh",
+                args=f"-lc {sq(f'command -v {cmd} >/dev/null 2>&1')}",
+                timeout=min(timeout, 30),
+                workdir="/",
+            )
+            return str(code) == "0"
+
+        if "go" in repo_language and not has_cmd("go"):
+            return preflight_missing("go")
+        if any(x in repo_language for x in ("javascript", "typescript", "node")) and not (
+            has_cmd("node") and has_cmd("npm")
+        ):
+            return preflight_missing("node")
+        if "python" in repo_language and not (has_cmd("python") or has_cmd("python3")):
+            return preflight_missing("python")
+
+        if "python" in repo_language:
+            py = "python" if has_cmd("python") else "python3"
+            file_args = " ".join(sq(p) for p in selected) if selected else ""
+            test_cmd = (
+                f"PYTEST_ADDOPTS= PYTHONWARNINGS=default {py} -m pytest -q -W ignore::pytest.PytestWarning {file_args}"
+            ).strip()
+        elif "go" in repo_language:
+            test_cmd = "go test ./..." if not selected else "go test " + " ".join(sq(p) for p in selected)
+        else:
+            if has_cmd("bash"):
+                test_cmd = "bash -lc " + sq(
+                    "if [ -x ./node_modules/.bin/jest ]; then "
+                    "./node_modules/.bin/jest --runInBand "
+                    + (" ".join(sq(p) for p in selected) if selected else "")
+                    + "; "
+                    "elif [ -x ./node_modules/.bin/mocha ]; then "
+                    "./node_modules/.bin/mocha --timeout 20000 --exit "
+                    + (" ".join(sq(p) for p in selected) if selected else "")
+                    + "; "
+                    "else npm test --silent -- "
+                    + (" ".join(sq(p) for p in selected) if selected else "")
+                    + "; fi"
+                )
+            else:
+                test_cmd = "npm test --silent -- " + (" ".join(sq(p) for p in selected) if selected else "")
+
+        script = f"cd /testbed && {test_cmd}"
+        output, code = self.run(
+            "/bin/sh", args=f"-lc {sq(script)}", timeout=timeout, workdir="/"
+        )
+        code_s = str(code)
+
+        output_s = output or ""
+        tests_passed_by_summary = False
+        if re.search(r"\b0 failing\b", output_s):
+            tests_passed_by_summary = True
+        if re.search(r"\b0 failed\b", output_s):
+            tests_passed_by_summary = True
+        if re.search(r"\b\d+\s+passed\b", output_s) and not re.search(
+            r"\b\d+\s+failed\b", output_s
+        ):
+            tests_passed_by_summary = True
+        if re.search(r"Test Suites:\s*\d+\s+passed,\s*\d+\s+total", output_s) and re.search(
+            r"Tests:\s*\d+\s+passed,\s*\d+\s+total", output_s
+        ):
+            tests_passed_by_summary = True
+        if "All " in output_s and "assertions passed" in output_s:
+            tests_passed_by_summary = True
+
+        reward = 1.0 if (code_s == "0" or tests_passed_by_summary) else 0.0
+        test_output = f"[TEST]\n{output_s}".strip() + "\n"
+        return (reward, test_output) if get_test_output else reward
+
+    def swebenchpro_preflight(self, timeout: int = 30) -> tuple[bool, str]:
+        ds = self.ds or {}
+        repo_language = str(ds.get("repo_language") or "").lower()
+
+        def sq(s: str) -> str:
+            return "'" + s.replace("'", "'\"'\"'") + "'"
+
+        def has_cmd(cmd: str) -> bool:
+            out, code = self.run(
+                "/bin/sh",
+                args=f"-lc {sq(f'command -v {cmd} >/dev/null 2>&1; echo $?')}",
+                timeout=timeout,
+                workdir="/",
+            )
+            return str(out).strip().endswith("0")
+
+        if "go" in repo_language and not has_cmd("go"):
+            return False, "[PREFLIGHT]\nreward_unavailable: missing_go\n"
+        if any(x in repo_language for x in ("javascript", "typescript", "node")) and not (
+            has_cmd("node") and has_cmd("npm")
+        ):
+            return False, "[PREFLIGHT]\nreward_unavailable: missing_node\n"
+        if "python" in repo_language and not (has_cmd("python") or has_cmd("python3")):
+            return False, "[PREFLIGHT]\nreward_unavailable: missing_python\n"
+
+        return True, ""
+
     def _calculate_reward(self, get_test_output=False, timeout: int = 300) -> float:
+        if "jefzda/sweap-images" in self.docker_image:
+            return self._calculate_reward_swebenchpro(
+                get_test_output=get_test_output, timeout=timeout
+            )
         if self.swebench_verified:
             return self._calculate_reward_swebench(get_test_output=get_test_output, timeout=timeout)
         elif self.swesmith:

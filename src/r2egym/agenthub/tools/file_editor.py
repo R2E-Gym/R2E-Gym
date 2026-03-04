@@ -35,7 +35,10 @@ from typing import Dict, List, Tuple, Optional
 import warnings
 
 import sys
-import chardet
+try:
+    import chardet
+except Exception:
+    chardet = None
 
 # sys.stdout.reconfigure(encoding='utf-8')
 
@@ -197,7 +200,12 @@ class StrReplaceEditor:
 
     @staticmethod
     def read_path(path: Path) -> str:
-        encoding = chardet.detect(path.read_bytes())["encoding"]
+        encoding = None
+        if chardet is not None:
+            try:
+                encoding = chardet.detect(path.read_bytes())["encoding"]
+            except Exception:
+                encoding = None
         if encoding is None:
             encoding = "utf-8"
         return path.read_text(encoding=encoding)
@@ -216,11 +224,12 @@ class StrReplaceEditor:
         """
         if path.is_dir():
             if not python_only:
-                cmd = ["find", str(path), "-maxdepth", "2", "-not", "-path", "*/.*"]
+                cmd = ["find", "-L", str(path), "-maxdepth", "2", "-not", "-path", "*/.*"]
             else:
                 # Use `-type d -o -name '*.py'` to only list directories or *.py files
                 cmd = [
                     "find",
+                    "-L",
                     str(path),
                     "-maxdepth",
                     "2",

@@ -43,3 +43,4 @@ demo_file: "./r2egym/agenthub/config/localizer-demo"
 other_args:
   max_retries: 3
   timeout: 120
+  resource_monitor: false
