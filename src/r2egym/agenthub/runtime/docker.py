@@ -145,12 +145,19 @@ class DockerRuntime(ExecutionEnvironment):
         if self.backend == "docker":
             self.client = docker.from_env(timeout=120)
         elif self.backend == "kubernetes":
-            # Try in-cluster config first, fallback to kubeconfig
+            # Try in-cluster config first, fallback to kubeconfig.
+            # Use a per-instance Configuration (not the process-global default) so that
+            # concurrent DockerRuntime instances do not race on shared client config.
+            # With many threads each calling load_incluster_config()/CoreV1Api(), the
+            # global default Configuration gets rebuilt mid-flight, intermittently
+            # emitting requests with a missing auth header -> 401 UnauthorizedException;
+            # when the racing call is delete_namespaced_pod the sandbox pod is orphaned.
+            k8s_config = client.Configuration()
             try:
-                config.load_incluster_config()
+                config.load_incluster_config(client_configuration=k8s_config)
             except Exception:
-                config.load_kube_config()
-            self.client = client.CoreV1Api()
+                config.load_kube_config(client_configuration=k8s_config)
+            self.client = client.CoreV1Api(client.ApiClient(k8s_config))
 
         # Start the container
         self.container = None
