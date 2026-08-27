@@ -4,6 +4,7 @@ from time import sleep
 import time
 import uuid
 import tempfile
+from contextlib import contextmanager
 import docker
 from docker.models.containers import Container
 
@@ -583,9 +584,11 @@ class DockerRuntime(ExecutionEnvironment):
             # r2e_tests are in the / directory, move them to /root
             self.run(f"mv /r2e_tests {self.alt_path}/r2e_tests")
 
-            # make a softlink for /root/r2e_tests (if present)
-            self.run(f"ln -s {self.alt_path}/r2e_tests {self.repo_path}/r2e_tests")
-            # self.run(f"ln -s /r2e_tests {self.repo_path}/r2e_tests")
+            # NOTE: deliberately no symlink back into the repo here. run_tests.sh
+            # needs the tests reachable from the repo root, but a link that lives
+            # for the whole rollout cancels out the `mv` above and leaves the
+            # held-out tests readable by the agent. `_r2e_tests_linked` creates it
+            # only for the duration of a test run instead.
         except Exception as e:
             self.logger.error(f"Error setting up environment: {repr(e)}")
 
@@ -848,16 +851,52 @@ class DockerRuntime(ExecutionEnvironment):
         output, _ = self.run(f"cat /{self.alt_path}/{rel_file_path}")
         return output
 
+    @contextmanager
+    def _r2e_tests_linked(self):
+        """Link the held-out tests into the repo for the duration of a test run.
+
+        The generated run_tests.sh refers to the tests by a repo-relative path
+        (`pytest -rA r2e_tests`, see repo_analysis_args.get_test_command), and
+        r2e_tests is an importable package, so it has to be reachable from the
+        repo root while the tests execute. It must NOT be reachable outside of
+        that window: r2e_tests is listed in SKIP_FILES_NEW so that the agent
+        cannot read the tests it is graded on.
+        """
+        if self.swebench_verified or self.swesmith:
+            # these images ship their own /run_tests.sh and have no /root/r2e_tests
+            yield
+            return
+
+        link_path = f"{self.repo_path}/r2e_tests"
+        # rm first: `ln -s` into an existing directory silently nests the link
+        # inside it, and the test run would then collect no tests at all.
+        # The /r2e_tests branch covers a container that was reset() after
+        # setup_env, where the tests are back at their image location.
+        self.run(
+            f"rm -rf {link_path} && "
+            f"if [ -d {self.alt_path}/r2e_tests ]; then "
+            f"ln -s {self.alt_path}/r2e_tests {link_path}; "
+            f"elif [ -d /r2e_tests ]; then ln -s /r2e_tests {link_path}; fi"
+        )
+        try:
+            yield
+        finally:
+            self.run(f"rm -rf {link_path}")
+
     def run_tests(self, timeout: int = 300) -> tuple[str, str]:
-        output, error_code = self.run(f"bash {self.alt_path}/run_tests.sh", timeout=timeout)
+        with self._r2e_tests_linked():
+            output, error_code = self.run(
+                f"bash {self.alt_path}/run_tests.sh", timeout=timeout
+            )
         # Remove ANSI escape codes and \r characters
         output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
         return output, error_code
 
     def demux_run_tests(self) -> tuple[str, str, str]:
-        stdout, stderr, error_code = self.demux_run(
-            f"bash {self.alt_path}/run_tests.sh"
-        )
+        with self._r2e_tests_linked():
+            stdout, stderr, error_code = self.demux_run(
+                f"bash {self.alt_path}/run_tests.sh"
+            )
         # Remove ANSI escape codes and \r characters
         stdout = re.sub(r"\x1b\[[0-9;]*m|\r", "", stdout)
         stderr = re.sub(r"\x1b\[[0-9;]*m|\r", "", stderr)
